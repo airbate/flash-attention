@@ -81,6 +81,7 @@ from flash_attn.cute.config import (
     SM100_MAX_KV_STAGE,
     SM100_THREADS_PER_CTA,
     FwdConfig,
+    sm100_num_softmax_stats,
     sm100_smem_capacity,
     sm100_uneven_kv_smem,
 )
@@ -100,6 +101,9 @@ _LOG2_DTYPE_MAX = {
     cutlass.BFloat16: math.log2(3.3895313892515355e38),
 }
 
+# Native PV recipes: (FP32 normalizer, max_offset, rescale_threshold).
+# Offsets and thresholds are in log2 units; see Note [Low Precision Scaling].
+_MXFP8_PV_SOFTMAX = {"exact": (False, 8, 0.0), "fast": (True, 4, 4.0)}
 
 # NOTE [SM100 forward coordinate spaces]
 # R = m_block_size, C = cta_group_size, S = q_stage; a work tile spans R*C*S effective rows.
@@ -193,9 +197,12 @@ class FlashAttentionForwardSm100:
         config: FwdConfig,
         qk_blockscaled: bool = False,
         pv_blockscaled: bool = False,
+        pv_softmax: str = "exact",
     ):
         """config is a validated SM100/SM110 FwdConfig; the kernel copies its fields."""
         self.pv_blockscaled = pv_blockscaled
+        assert pv_softmax == "exact" or pv_blockscaled
+        self.pv_fp32_normalizer, self.pv_max_offset, self.pv_rescale_threshold = _MXFP8_PV_SOFTMAX[pv_softmax]
         self.pv_causal_bf16 = pv_blockscaled and is_causal
         if pv_blockscaled:
             assert qk_blockscaled and not is_local
@@ -525,6 +532,16 @@ class FlashAttentionForwardSm100:
         self.k_dtype = mK.element_type
         self.v_dtype = mV.element_type
         self.o_dtype = mO.element_type
+        # See Note [Low Precision Scaling]. Shared by the softmax and correction warps.
+        if const_expr(self.pv_blockscaled):
+            self.max_offset, self.rescale_threshold = self.pv_max_offset, self.pv_rescale_threshold
+        else:
+            self.max_offset = 8 if self.v_dtype.width == 8 else 0
+            self.rescale_threshold = 8.0 if self.v_dtype.width == 16 else 0.0
+        assert self.max_offset + self.rescale_threshold < _LOG2_DTYPE_MAX[self.v_dtype], (
+            f"max_offset ({self.max_offset}) + rescale_threshold ({self.rescale_threshold}) must "
+            f"stay below log2(max {self.v_dtype} value) to avoid saturating P"
+        )
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
         Q_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=Q_layout_transpose))
@@ -947,10 +964,12 @@ class FlashAttentionForwardSm100:
         load_epi_mbar_size = 2 if const_expr(self.overlap_sO_sQ) else 0
         sf_overlap_mbar_size = 4 if const_expr(self.sf_overlap) else 0
         sfp_size = 512 if const_expr(self.pv_blockscaled) else 0
-        # Native PV normalizes O with sum(quantized P); LSE needs sum(FP32 P),
-        # stored as a third per-row statistic when requested.
-        self.track_unquantized_sum = self.pv_blockscaled and mLSE is not None
-        self.num_stats = 3 if self.track_unquantized_sum else 2
+        # Track the FP32 sum for LSE or fast-mode normalization.
+        self.track_unquantized_sum = self.pv_blockscaled and (mLSE is not None or self.pv_fp32_normalizer)
+        self.num_stats = sm100_num_softmax_stats(
+            native_pv=self.pv_blockscaled, has_lse=mLSE is not None,
+            fp32_normalizer=self.pv_fp32_normalizer, dedicated_sf=self.dedicated_sf,
+        )
 
         @cute.struct
         class SharedStorage:
@@ -2752,8 +2771,6 @@ class FlashAttentionForwardSm100:
 
             qk_descale, _ = self._load_effective_descales(descale_tensors, batch_idx, kv_head_idx)
 
-            # See Note [Low Precision Scaling]
-            max_offset = 8 if cutlass.const_expr(self.v_dtype.width == 8) else 0
             if const_expr(self.score_mod is None):
                 softmax_scale_log2_eff = softmax_scale_log2 * qk_descale
                 softmax_scale_eff = None
@@ -2761,17 +2778,11 @@ class FlashAttentionForwardSm100:
                 softmax_scale_log2_eff = softmax_scale_log2
                 softmax_scale_eff = softmax_scale * qk_descale
 
-            rescale_threshold = 8.0 if const_expr(self.v_dtype.width == 16) else 0.0
-            # See Note [Low Precision Scaling]
-            assert max_offset + rescale_threshold < _LOG2_DTYPE_MAX[self.v_dtype], (
-                f"max_offset ({max_offset}) + rescale_threshold ({rescale_threshold}) must stay "
-                f"below log2(max {self.v_dtype} value) to avoid saturating P"
-            )
             softmax = SoftmaxSm100.create(
                 softmax_scale_log2_eff,
-                rescale_threshold=rescale_threshold,
+                rescale_threshold=self.rescale_threshold,
                 softmax_scale=softmax_scale_eff,
-                max_offset=max_offset,
+                max_offset=self.max_offset,
                 track_unquantized_sum=self.track_unquantized_sum,
             )
             softmax.reset()
@@ -2947,7 +2958,7 @@ class FlashAttentionForwardSm100:
                     else:
                         sm_stats_index = stage
                     sScale[tidx + sm_stats_index * self.m_block_size] = softmax.row_sum[0]
-                    if const_expr(self.track_unquantized_sum):
+                    if const_expr(self.num_stats == 3):
                         sScale[tidx + (stage + 2 * self.q_stage) * self.m_block_size] = softmax.row_sum_unquantized[0]
                     if const_expr(mLSE is not None or learnable_sink is not None):
                         sScale[
@@ -3119,7 +3130,7 @@ class FlashAttentionForwardSm100:
             cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=p_dtype), tSrS_t2r.layout
         )
         unquantized_sum_init = None
-        if const_expr(self.track_unquantized_sum and not self.dedicated_sf):
+        if const_expr(self.track_unquantized_sum and (not self.dedicated_sf or self.pv_fp32_normalizer)):
             unquantized_sum_init = Float32(0.0)
             if const_expr(not is_first):
                 unquantized_sum_init = softmax.row_sum_unquantized[0] * acc_scale
@@ -3158,7 +3169,10 @@ class FlashAttentionForwardSm100:
             )
         elif const_expr(not self.sm_stats_late_acquire):
             pipeline_sm_stats.producer_acquire_w_index_phase(stage, sm_stats_producer_phase)
-        if const_expr(self.pv_blockscaled and not self.dedicated_sf):
+        if const_expr(self.pv_fp32_normalizer):
+            # O and LSE share the FP32 sum reduced per fragment in apply_exp2_convert.
+            softmax.row_sum[0] = softmax.row_sum_unquantized[0]
+        elif const_expr(self.pv_blockscaled and not self.dedicated_sf):
             softmax.update_row_sum_quantized_streaming(tSrP_r2t_f32, p_dtype, acc_scale, is_first)
         elif const_expr(self.pv_blockscaled):
             # E4M3 is exact in FP16, but BF16's small probabilities are not.
@@ -3249,11 +3263,9 @@ class FlashAttentionForwardSm100:
             else:
                 softmax_scale_log2_eff = softmax_scale_log2
 
-            # Must match the softmax warp's max_offset; max_offset_scale = 2^max_offset.
-            max_offset = Float32(8.0) if cutlass.const_expr(self.v_dtype.width == 8) else Float32(0.0)
-            max_offset_scale = (
-                Float32(256.0) if cutlass.const_expr(self.v_dtype.width == 8) else Float32(1.0)
-            )
+            # The softmax warps' max_offset; max_offset_scale = 2^max_offset.
+            max_offset = Float32(float(self.max_offset))
+            max_offset_scale = Float32(float(2**self.max_offset))
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(
                 seqlen, work_m, split_idx=split_idx, num_splits=num_splits,
@@ -3387,7 +3399,7 @@ class FlashAttentionForwardSm100:
                         row_max = sScale[tidx + sm_stats_index * self.m_block_size + self.s_p_o_stage * self.m_block_size]
                     else:
                         row_max = None
-                    if const_expr(self.track_unquantized_sum):
+                    if const_expr(self.num_stats == 3):
                         row_sum_lse = sScale[tidx + (stage + 2 * self.q_stage) * self.m_block_size]
                     else:
                         row_sum_lse = row_sum
