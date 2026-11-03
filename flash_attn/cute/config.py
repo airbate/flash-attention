@@ -407,6 +407,7 @@ class PvFastTuning(NamedTuple):
 
     registers: Sm100Registers | None = None  # None: native-PV split
     ex2_emu_freq: int = 0
+    ex2_emu_start_frg: int | None = None  # None: the dtype tuning's start fragment
 
 
 # Keyed by arch, then (head_dim_padded, is_causal); missing keys keep the defaults. sm_107 is tuned
@@ -419,9 +420,17 @@ MXFP8_PV_FAST_TUNING = {
         (128, True): PvFastTuning(Sm100Registers(192, 64, 64), ex2_emu_freq=8),
         (64, False): PvFastTuning(ex2_emu_freq=8),
         (64, True): PvFastTuning(ex2_emu_freq=8),
+        (256, False): PvFastTuning(
+            Sm100Registers(208, 64, 120), ex2_emu_freq=8, ex2_emu_start_frg=1
+        ),
+        (256, True): PvFastTuning(
+            Sm100Registers(208, 64, 120), ex2_emu_freq=8, ex2_emu_start_frg=1
+        ),
     },
-    # The "exact" registers are already the best choice.
-    "sm_103": {},
+    "sm_103": {
+        # hd64/hd128 keep the "exact" registers; hd256 non-causal takes the sm_100 split.
+        (256, False): PvFastTuning(Sm100Registers(208, 64, 120)),
+    },
 }
 
 
@@ -464,6 +473,9 @@ SM107_MXFP8_PV_TUNING = {
     ),
     ("fast", 64, False): Sm107PvTuning(Sm100Registers(168, 96, 80), stats_mbarrier=True),
     ("fast", 64, True): Sm107PvTuning(Sm100Registers(192, 64, 64), stats_mbarrier=True),
+    # hd256 (S ping-pong) keeps the per-warp stats barriers, which its slot protocol uses.
+    ("fast", 256, False): Sm107PvTuning(split_p=True),
+    ("fast", 256, True): Sm107PvTuning(split_p=True),
 }
 # NOTE [softmax stats release order]
 # The SM100 correction warpgroup frees softmax stage s's pipeline_sm_stats slot in either order:
@@ -592,6 +604,11 @@ def select_mxfp8_pv_registers(inputs: FwdHeuristicInputs, *, q_stage: int) -> Sm
         return sm107_pv_tuning(inputs).registers
     if fast_registers := mxfp8_pv_fast_tuning(inputs).registers:
         return fast_registers
+    if inputs.is_hdim256 and family == "sm_100":
+        # S ping-pong has one softmax warpgroup, which the splits below (sized for two) do not
+        # use fully; sm_100 is softmax-bound. On sm_103 "exact" this split measured flat, so it
+        # keeps the splits below.
+        return Sm100Registers(208, 64, 120)
     if inputs.mxfp8_path == "pv" and q_stage == 2 and inputs.head_dim_padded >= 96:
         # The ones MMA (pv_ones_step_sum) adds register pressure outside the softmax warps: hd128
         # splits with the fewest spills under the extra MMA-warp pressure.
@@ -668,7 +685,10 @@ def select_ex2_emu(inputs: FwdHeuristicInputs, *, use_2cta_instrs: bool) -> tupl
     if sm100_native_pv(inputs):
         # Exact keeps MUFU.EX2: polynomial exp2 can cross E4M3 rounding boundaries.
         # Fast permits emulation according to its tuning row.
-        freq = mxfp8_pv_fast_tuning(inputs).ex2_emu_freq
+        fast = mxfp8_pv_fast_tuning(inputs)
+        freq = fast.ex2_emu_freq
+        if fast.ex2_emu_start_frg is not None:
+            start_frg = fast.ex2_emu_start_frg
         return (freq, start_frg) if freq else (0, 0)
     if "ex2_emu_freq" in tune:
         enabled = tune["ex2_emu_freq"] > 0
@@ -1216,18 +1236,21 @@ def sm100_fwd_scale_bytes(inputs: FwdHeuristicInputs, *, q_stage: int) -> tuple[
     """
     if inputs.mxfp8_path is None:
         return 0, 0, 0
-    chunk_bytes = 128 * 4 * ceil_div(inputs.head_dim, 128)
-    fixed = 512 if sm100_native_pv(inputs) else 0
+    native_pv = sm100_native_pv(inputs)
+    # A K/V stage holds K's scales, and native PV's V scales in the same slot.
+    kv_dim = max(inputs.head_dim, inputs.head_dim_v) if native_pv else inputs.head_dim
+    fixed = 512 if native_pv else 0
     if inputs.mxfp8_path == "pv":
         ones_tile, ones_align = SM100_PV_ONES_TILE_ELEMS, SM100_PV_ONES_ALIGN_BYTES
         if sm100_arch_family(inputs.device_arch) == "sm_107":
             # pv_ones_acc_sum: the E4M3 tile, the BF16 one for causal diagonal blocks, and
             # padding for both fields.
             fixed += ones_tile + (2 * ones_tile if inputs.causal else 0) + 2 * ones_align
-        elif q_stage == 2:
-            # pv_ones_step_sum: the E4M3 tile and its padding.
+        elif q_stage == 2 or inputs.is_hdim256:
+            # pv_ones_step_sum (two Q stages) or pv_ones_pp_sum (hd256 S ping-pong): the E4M3
+            # tile and its padding.
             fixed += ones_tile + ones_align
-    return q_stage * chunk_bytes, chunk_bytes, fixed
+    return q_stage * 512 * ceil_div(inputs.head_dim, 128), 512 * ceil_div(kv_dim, 128), fixed
 
 
 def select_sm100_smem_layout(
