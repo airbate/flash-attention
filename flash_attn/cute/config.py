@@ -69,6 +69,8 @@ class FwdConfig:
     has_tile_count_semaphore without the flag. See routes_dynamic_varlen.
     lpt_global orders a 1CTA unsplit dense CLC launch longest-first over the whole problem
     instead of per L2 section; see NOTE [global LPT].
+    split_p_k64, sm_stats_mbarrier, and sm_stats_early are the sm_107 native MXFP8 PV schedule
+    (see Sm107PvTuning); every other forward carries False.
     """
 
     device_capacity: int
@@ -94,6 +96,9 @@ class FwdConfig:
     use_swapab: bool = False
     use_dynamic_varlen: bool = False
     lpt_global: bool = False
+    split_p_k64: bool = False
+    sm_stats_mbarrier: bool = False
+    sm_stats_early: bool = False
 
 
 class FwdHeuristicInputs(NamedTuple):
@@ -421,22 +426,44 @@ MXFP8_PV_FAST_TUNING = {
 
 
 class Sm107PvTuning(NamedTuple):
-    """sm_107 native PV (dedicated scale columns) choices; none changes the arithmetic."""
+    """Default sm_107 native-PV register, schedule, and shared-memory choices.
+
+    These choices preserve the arithmetic; missing tuning rows use the field defaults.
+    """
 
     # None keeps the generic FP8 split.
     registers: Sm100Registers | None = None
+    # Split P arrival at the K=64 instruction boundary: PV issues its first MMA on the first 64
+    # keys of P while the softmax warps still store the rest.
+    split_p: bool = False
+    # Signal the softmax -> correction stats with the pipeline_sm_stats mbarrier instead of the
+    # per-warp named barriers.
+    stats_mbarrier: bool = False
+    # Keep P's exponentials dependent on acc_scale so its computation cannot trail them,
+    # allowing earlier publication to the correction warps.
+    early_stats: bool = False
+    # Budget for Q/O, fixed scale storage, and the K/V ring; None uses the generic budget.
+    # Causal native PV sizes K/V slots for BF16 V on diagonal blocks.
+    smem_budget_kib: int | None = None
 
 
 # Keyed by (pv_softmax, head_dim_padded, is_causal); missing keys use the defaults. "exact" has no
 # softmax-side quantized row sum (pv_ones_acc_sum), hence its own spill-free register splits.
 SM107_MXFP8_PV_TUNING = {
-    ("exact", 128, False): Sm107PvTuning(Sm100Registers(192, 80, 48)),
-    ("exact", 128, True): Sm107PvTuning(Sm100Registers(184, 80, 64)),
+    ("exact", 128, False): Sm107PvTuning(
+        Sm100Registers(192, 80, 48), stats_mbarrier=True, early_stats=True
+    ),
+    ("exact", 128, True): Sm107PvTuning(
+        Sm100Registers(184, 80, 64), stats_mbarrier=True, early_stats=True, smem_budget_kib=288
+    ),
     ("exact", 64, False): Sm107PvTuning(Sm100Registers(176, 96, 64)),
     ("exact", 64, True): Sm107PvTuning(Sm100Registers(184, 72, 72)),
-    ("fast", 128, False): Sm107PvTuning(Sm100Registers(168, 96, 80)),
-    ("fast", 64, False): Sm107PvTuning(Sm100Registers(168, 96, 80)),
-    ("fast", 64, True): Sm107PvTuning(Sm100Registers(192, 64, 64)),
+    ("fast", 128, False): Sm107PvTuning(Sm100Registers(168, 96, 80), split_p=True),
+    ("fast", 128, True): Sm107PvTuning(
+        split_p=True, stats_mbarrier=True, early_stats=True, smem_budget_kib=288
+    ),
+    ("fast", 64, False): Sm107PvTuning(Sm100Registers(168, 96, 80), stats_mbarrier=True),
+    ("fast", 64, True): Sm107PvTuning(Sm100Registers(192, 64, 64), stats_mbarrier=True),
 }
 # NOTE [softmax stats release order]
 # The SM100 correction warpgroup frees softmax stage s's pipeline_sm_stats slot in either order:
@@ -538,13 +565,31 @@ def mxfp8_pv_fast_tuning(inputs: FwdHeuristicInputs) -> PvFastTuning:
     return MXFP8_PV_FAST_TUNING.get(family, {}).get(key, PvFastTuning())
 
 
+def sm107_pv_tuning(inputs: FwdHeuristicInputs) -> Sm107PvTuning:
+    """The SM107_MXFP8_PV_TUNING row of sm_107 native PV; defaults (no row) elsewhere."""
+    if sm100_arch_family(inputs.device_arch) != "sm_107" or not sm100_native_pv(inputs):
+        return Sm107PvTuning()
+    pv_softmax = "fast" if inputs.mxfp8_path == "pv_fast" else "exact"
+    return SM107_MXFP8_PV_TUNING.get(
+        (pv_softmax, inputs.head_dim_padded, inputs.causal), Sm107PvTuning()
+    )
+
+
+def select_sm107_pv_schedule(inputs: FwdHeuristicInputs) -> dict[str, bool]:
+    """FwdConfig's sm_107 native PV schedule fields, all False elsewhere."""
+    tuning = sm107_pv_tuning(inputs)
+    return dict(
+        split_p_k64=tuning.split_p,
+        sm_stats_mbarrier=tuning.stats_mbarrier,
+        sm_stats_early=tuning.early_stats,
+    )
+
+
 def select_mxfp8_pv_registers(inputs: FwdHeuristicInputs, *, q_stage: int) -> Sm100Registers | None:
     """Native MXFP8 PV register split; None keeps the FP8 split."""
     family = sm100_arch_family(inputs.device_arch)
-    key = (inputs.head_dim_padded, inputs.causal)
     if family == "sm_107":
-        pv_softmax = "fast" if inputs.mxfp8_path == "pv_fast" else "exact"
-        return SM107_MXFP8_PV_TUNING.get((pv_softmax, *key), Sm107PvTuning()).registers
+        return sm107_pv_tuning(inputs).registers
     if fast_registers := mxfp8_pv_fast_tuning(inputs).registers:
         return fast_registers
     if inputs.mxfp8_path == "pv" and q_stage == 2 and inputs.head_dim_padded >= 96:
@@ -1220,7 +1265,9 @@ def select_sm100_smem_layout(
     # MXFP8 Q scales count with sQ, and each K/V stage holds its scales.
     sfq, sfkv, sf_fixed = sm100_fwd_scale_bytes(inputs, q_stage=q_stage)
     q_o = (max(q + sfq, o) if overlap_sO_sQ else q + sfq + o) + sf_fixed
-    kv_stage = min((_SM100_KV_STAGE_BUDGET_BYTES - q_o) // (max(k, v) + sfkv), SM100_MAX_KV_STAGE)
+    budget_kib = sm107_pv_tuning(inputs).smem_budget_kib
+    budget = _SM100_KV_STAGE_BUDGET_BYTES if budget_kib is None else budget_kib * 1024
+    kv_stage = min((budget - q_o) // (max(k, v) + sfkv), SM100_MAX_KV_STAGE)
     # 1CTA hd192/128 fits a third stage with the uneven [K, V, K] layout.
     if sm100_uneven_kv_smem(head_dim_padded, head_dim_v_padded, kv_stage + 1, use_2cta_instrs):
         kv_stage = 3
@@ -1830,6 +1877,7 @@ def _select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
         kv_stage=kv_stage,
         lpt_global=lpt_global,
         sm_stats_cross_stage=select_sm_stats_cross_stage(inputs, use_s_ping_pong=use_s_ping_pong),
+        **select_sm107_pv_schedule(inputs),
     )
     validate_fwd_config(config, inputs)
     return config
@@ -1839,8 +1887,9 @@ def derive_fwd_config(base: FwdConfig, inputs: FwdHeuristicInputs, **changes) ->
     """Apply changes to base and re-derive the fields the selector computes from them.
 
     registers, the exp2 emulation, the SM100 SMEM layout (overlap_sO_sQ, kv_stage), the softmax
-    stats release order, and lpt_global are recomputed for the changed tile, stage, split, 2CTA,
-    S ping-pong, PackGQA, and scheduler choices unless changes sets them. The result is validated.
+    stats release order, lpt_global, and the sm_107 native PV schedule are recomputed for the
+    changed tile, stage, split, 2CTA, S ping-pong, PackGQA, and scheduler choices unless changes
+    sets them. The result is validated.
     """
     config = replace(base, **changes)
     # use_dynamic_varlen runs with the tile semaphore the interface allocates.
@@ -1858,6 +1907,9 @@ def derive_fwd_config(base: FwdConfig, inputs: FwdHeuristicInputs, **changes) ->
             overlap_sO_sQ=False,
             kv_stage=0,
             sm_stats_cross_stage=False,
+            split_p_k64=False,
+            sm_stats_mbarrier=False,
+            sm_stats_early=False,
         )
     else:
         ex2_emu_freq, ex2_emu_start_frg = select_ex2_emu(
@@ -1894,6 +1946,7 @@ def derive_fwd_config(base: FwdConfig, inputs: FwdHeuristicInputs, **changes) ->
                 use_2cta_instrs=config.use_2cta_instrs,
                 num_splits=config.num_splits,
             ),
+            **select_sm107_pv_schedule(resolved),
         )
     # The register tables cover only supported tiles and stages; validation rejects the rest.
     if "registers" not in changes and not config.use_swapab:
@@ -1956,6 +2009,9 @@ _FWD_SM100_ONLY_NEUTRAL_FIELDS = dict(
     kv_stage=0,
     lpt_global=False,
     sm_stats_cross_stage=False,
+    split_p_k64=False,
+    sm_stats_mbarrier=False,
+    sm_stats_early=False,
 )
 
 
@@ -2120,6 +2176,11 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
         raise ValueError("S ping-pong is not supported for this forward problem")
     if config.use_s_ping_pong and config.sm_stats_cross_stage:
         raise ValueError("S ping-pong keeps its own softmax stats release order")
+    sm107_pv = sm100_arch_family(inputs.device_arch) == "sm_107" and sm100_native_pv(inputs)
+    if (config.split_p_k64 or config.sm_stats_mbarrier or config.sm_stats_early) and not sm107_pv:
+        raise ValueError(
+            "split_p_k64, sm_stats_mbarrier, and sm_stats_early need sm_107 native MXFP8 PV"
+        )
     if config.use_2cta_instrs and not is_2cta_eligible(
         inputs,
         tile_m=config.tile_m,
