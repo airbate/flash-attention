@@ -7,6 +7,8 @@ import pytest
 
 from flash_attn.cute import config as config_module
 from flash_attn.cute.config import (
+    SM100_PV_ONES_ALIGN_BYTES,
+    SM100_PV_ONES_TILE_ELEMS,
     SM100_SMEM_BYTES,
     FwdConfig,
     FwdHeuristicInputs,
@@ -19,6 +21,7 @@ from flash_attn.cute.config import (
     select_registers,
     select_sm100_smem_layout,
     sm100_fwd_smem_bytes,
+    sm100_smem_capacity,
     sm100_uneven_kv_smem,
     validate_fwd_config,
 )
@@ -904,6 +907,15 @@ def test_mxfp8_qk_policy_follows_its_own_rows():
     assert select_fwd_config(causal_hd64._replace(device_arch=103)).sm_stats_cross_stage
 
 
+def pv_ones_bytes(device_arch, causal):
+    """Fixed SMEM of "exact" native PV's all-ones tiles: E4M3 (+ BF16 if causal on sm_107) plus
+    alignment padding per field."""
+    tile, align = SM100_PV_ONES_TILE_ELEMS, SM100_PV_ONES_ALIGN_BYTES
+    if device_arch == 107:
+        return tile + (2 * tile if causal else 0) + 2 * align
+    return tile + align
+
+
 @pytest.mark.parametrize("mxfp8_path", ["qk", "pv", "pv_fast"])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("causal", [False, True])
@@ -917,11 +929,14 @@ def test_mxfp8_kv_stages_fit_the_scales(mxfp8_path, head_dim, causal, device_arc
     rows = config.q_stage * 128
     q_o = rows * head_dim + config.q_stage * 512 + rows * head_dim * 2
     q_o += 0 if mxfp8_path == "qk" else 512
+    if mxfp8_path == "pv" and (device_arch == 107 or config.q_stage == 2):
+        q_o += pv_ones_bytes(device_arch, causal)  # all-ones tiles of the P row-sum MMAs
     bf16_v = mxfp8_path == "qk" or causal  # causal native PV: BF16 diagonal V blocks
     kv_stage_bytes = 128 * head_dim * (2 if bf16_v else 1) + 512
     assert config.kv_stage == min((224 * 1024 - q_o) // kv_stage_bytes, 32)
     for has_lse in (False, True):
-        assert sm100_fwd_smem_bytes(config, inputs._replace(has_lse=has_lse)) <= SM100_SMEM_BYTES
+        smem_bytes = sm100_fwd_smem_bytes(config, inputs._replace(has_lse=has_lse))
+        assert smem_bytes <= sm100_smem_capacity(device_arch)
 
 
 def test_mxfp8_pv_register_splits():
@@ -932,22 +947,21 @@ def test_mxfp8_pv_register_splits():
         assert not (config.use_2cta_instrs or config.use_s_ping_pong)
         return astuple(config.registers)
 
-    # sm_100/sm_103: the MMA warp needs more than the hd128 FP8 default leaves it.
-    assert registers() == (184, 80, 64)
+    # sm_100/sm_103 with two Q stages: the ones MMA adds MMA-warp pressure at hd128.
+    assert registers() == (176, 64, 96)
+    # Otherwise the MMA warp needs more than the hd128 FP8 default leaves it.
+    assert registers(max_seqlen_q=128, total_q=256) == (184, 80, 64)
     assert registers(head_dim=64, head_dim_v=64) == (192, 64, 64)
-    assert registers(device_arch=103) == (168, 96, 80)
-    # sm_107 has dedicated scale columns: only hd64 overrides the FP8 split.
-    assert registers(device_arch=107, head_dim=64, head_dim_v=64) == (160, 96, 96)
-    assert registers(device_arch=107) == astuple(
-        select_fwd_config(pv._replace(device_arch=107, mxfp8_path=None, pack_gqa=False,
-                                      disable_2cta=True)).registers
-    )
-    # Causal native PV without CLC runs a single-tile scheduler, so sm_103 keeps the sm_100
-    # split, and sm_107 hd64 keeps the FP8 one.
+    assert registers(device_arch=103, max_seqlen_q=128, total_q=256) == (168, 96, 80)
+    # sm_107 has dedicated scale columns and its own "exact" table.
+    assert registers(device_arch=107) == (192, 80, 48)
+    assert registers(device_arch=107, head_dim=64, head_dim_v=64) == (176, 96, 64)
+    assert registers(device_arch=107, head_dim=64, head_dim_v=64, causal=True) == (184, 72, 72)
+    # Causal native PV without CLC runs a single-tile scheduler: no sm_103-specific split, so
+    # both families take the ones-MMA causal hd128 split.
     causal_103 = pv._replace(device_arch=103, causal=True)
     no_clc = derive_fwd_config(select_fwd_config(causal_103), causal_103, use_clc_scheduler=False)
-    assert astuple(no_clc.registers) == (184, 80, 64)
-    assert registers(device_arch=107, head_dim=64, head_dim_v=64, causal=True) == (168, 96, 80)
+    assert astuple(no_clc.registers) == (176, 80, 80)
 
 
 _MXFP8_CAUSAL = dict(dtype="torch.float8_e4m3fn", causal=True)
@@ -997,11 +1011,9 @@ def test_mxfp8_pv_keeps_hardware_exp2():
 def test_mxfp8_pv_fast_policy():
     fast = make_inputs(dtype="torch.float8_e4m3fn", head_dim=128, head_dim_v=128,
                        mxfp8_path="pv_fast")
-    # sm_100 "fast" has its own spill-free splits; sm_103 keeps the "exact" ones.
+    # sm_100 "fast" has its own spill-free splits; sm_103 keeps the native-PV one.
     assert astuple(select_fwd_config(fast).registers) == (176, 64, 96)
-    assert select_fwd_config(fast._replace(device_arch=103)).registers == select_fwd_config(
-        fast._replace(device_arch=103, mxfp8_path="pv")
-    ).registers
+    assert astuple(select_fwd_config(fast._replace(device_arch=103)).registers) == (168, 96, 80)
     assert astuple(select_fwd_config(fast._replace(device_arch=107)).registers) == (168, 96, 80)
     # Causal "fast" hd128 runs CLC with its own split on sm_100 and sm_103.
     causal_inputs = fast._replace(causal=True)
